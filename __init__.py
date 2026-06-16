@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Modular Stair Generator",
     "author": "Codex",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Add > Mesh > Modular Stairs",
     "description": "Generate merged modular stairs running from the origin along negative Y.",
@@ -10,7 +10,7 @@ bl_info = {
 
 import bmesh
 import bpy
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty
+from bpy.props import BoolProperty, FloatProperty, IntProperty
 from bpy.types import Operator
 from bpy_extras.object_utils import AddObjectHelper, object_data_add
 
@@ -44,7 +44,7 @@ def _add_face(indices, faces, face_lookup):
     faces.append(indices)
 
 
-def _step_profile(step_index, tread, riser, has_layer, layer_z_offset, is_simple):
+def _step_profile(step_index, tread, riser, use_lower_slab, lower_slab_z_offset, is_simple):
     y_front = -step_index * tread
     y_back = -(step_index + 1) * tread
     z_base = step_index * riser
@@ -60,6 +60,7 @@ def _step_profile(step_index, tread, riser, has_layer, layer_z_offset, is_simple
             },
             "cap_faces": (("B", "C", "D", "E"),),
             "outer_edges": (("B", "C"), ("C", "D"), ("D", "E"), ("E", "B")),
+            "bottom_edge": None,
         }
 
     z_under_front = z_base - riser
@@ -73,24 +74,62 @@ def _step_profile(step_index, tread, riser, has_layer, layer_z_offset, is_simple
     cap_faces = [("A", "B", "E"), ("B", "C", "D", "E")]
     outer_edges = [("A", "B"), ("B", "C"), ("C", "D"), ("D", "E")]
 
-    if has_layer and layer_z_offset > EPSILON:
-        points["F"] = (y_front, z_under_front - layer_z_offset)
-        points["G"] = (y_back, z_base - layer_z_offset)
+    if use_lower_slab and lower_slab_z_offset > EPSILON:
+        points["F"] = (y_front, z_under_front - lower_slab_z_offset)
+        points["G"] = (y_back, z_base - lower_slab_z_offset)
         cap_faces.insert(0, ("F", "A", "E", "G"))
         outer_edges.extend((("E", "G"), ("G", "F"), ("F", "A")))
+        bottom_edge = ("G", "F")
     else:
         outer_edges.append(("E", "A"))
+        bottom_edge = ("E", "A")
 
     return {
         "points": points,
         "cap_faces": tuple(cap_faces),
         "outer_edges": tuple(outer_edges),
+        "bottom_edge": bottom_edge,
     }
 
 
-def build_stair_mesh(name, step_count, width, riser, tread, stair_type, layer_z_offset, simple_start, simple_end):
+def _reinforcement_width(total_width, requested_width):
+    maximum_width = total_width * 0.5 - EPSILON
+    if maximum_width <= EPSILON:
+        return 0.0
+    return min(max(requested_width, 0.0), maximum_width)
+
+
+def _reinforcement_x_values(half_width, rib_width):
+    if rib_width <= EPSILON:
+        return (-half_width, half_width)
+    return (
+        -half_width,
+        -half_width + rib_width,
+        half_width - rib_width,
+        half_width,
+    )
+
+
+def build_stair_mesh(
+    name,
+    step_count,
+    width,
+    riser,
+    tread,
+    use_lower_slab,
+    lower_slab_z_offset,
+    use_side_ribs,
+    rib_width,
+    rib_z_offset,
+    cut_top,
+    simple_start,
+    simple_end,
+):
     half_width = width * 0.5
-    has_layer = stair_type == "LAYER"
+    rib_width = _reinforcement_width(width, rib_width)
+    can_build_ribs = use_side_ribs and rib_width > EPSILON and rib_z_offset > EPSILON
+    rib_x_values = _reinforcement_x_values(half_width, rib_width)
+    full_x_values = (-half_width, half_width)
     vertices = []
     faces = []
     vertex_lookup = {}
@@ -108,35 +147,96 @@ def build_stair_mesh(name, step_count, width, riser, tread, stair_type, layer_z_
             step_index,
             tread,
             riser,
-            has_layer,
-            layer_z_offset,
+            use_lower_slab,
+            lower_slab_z_offset,
             is_simple,
         )
 
-        left = {
-            name: vertex_for(point, -half_width)
-            for name, point in profile["points"].items()
-        }
-        right = {
-            name: vertex_for(point, half_width)
-            for name, point in profile["points"].items()
-        }
+        def vertices_for_names(names, x_value):
+            return [vertex_for(profile["points"][point_name], x_value) for point_name in names]
 
         for cap_face in profile["cap_faces"]:
-            _add_face([left[name] for name in cap_face], faces, face_lookup)
-            _add_face([right[name] for name in reversed(cap_face)], faces, face_lookup)
+            _add_face(vertices_for_names(cap_face, -half_width), faces, face_lookup)
+            _add_face(vertices_for_names(reversed(cap_face), half_width), faces, face_lookup)
 
         for edge_start, edge_end in profile["outer_edges"]:
-            _add_face(
-                [
-                    left[edge_start],
-                    left[edge_end],
-                    right[edge_end],
-                    right[edge_start],
-                ],
-                faces,
-                face_lookup,
-            )
+            x_values = full_x_values
+            if can_build_ribs and profile["bottom_edge"] == (edge_start, edge_end):
+                x_values = rib_x_values
+            elif can_build_ribs and cut_top:
+                x_values = rib_x_values
+
+            for x_start, x_end in zip(x_values, x_values[1:]):
+                _add_face(
+                    [
+                        vertex_for(profile["points"][edge_start], x_start),
+                        vertex_for(profile["points"][edge_end], x_start),
+                        vertex_for(profile["points"][edge_end], x_end),
+                        vertex_for(profile["points"][edge_start], x_end),
+                    ],
+                    faces,
+                    face_lookup,
+                )
+
+        if can_build_ribs and profile["bottom_edge"] and not is_simple:
+            bottom_start, bottom_end = profile["bottom_edge"]
+            for outer_x, inner_x in (
+                (-half_width, -half_width + rib_width),
+                (half_width, half_width - rib_width),
+            ):
+                start_outer = vertex_for(profile["points"][bottom_start], outer_x)
+                start_inner = vertex_for(profile["points"][bottom_start], inner_x)
+                end_outer = vertex_for(profile["points"][bottom_end], outer_x)
+                end_inner = vertex_for(profile["points"][bottom_end], inner_x)
+
+                start_y, start_z = profile["points"][bottom_start]
+                end_y, end_z = profile["points"][bottom_end]
+                start_outer_down = _add_vertex(
+                    (outer_x, start_y, start_z - rib_z_offset),
+                    vertices,
+                    vertex_lookup,
+                )
+                start_inner_down = _add_vertex(
+                    (inner_x, start_y, start_z - rib_z_offset),
+                    vertices,
+                    vertex_lookup,
+                )
+                end_outer_down = _add_vertex(
+                    (outer_x, end_y, end_z - rib_z_offset),
+                    vertices,
+                    vertex_lookup,
+                )
+                end_inner_down = _add_vertex(
+                    (inner_x, end_y, end_z - rib_z_offset),
+                    vertices,
+                    vertex_lookup,
+                )
+
+                _add_face(
+                    [start_outer_down, end_outer_down, end_inner_down, start_inner_down],
+                    faces,
+                    face_lookup,
+                )
+                _add_face(
+                    [start_outer, start_outer_down, start_inner_down, start_inner],
+                    faces,
+                    face_lookup,
+                )
+                _add_face(
+                    [end_inner, end_inner_down, end_outer_down, end_outer],
+                    faces,
+                    face_lookup,
+                )
+                _add_face(
+                    [start_outer, end_outer, end_outer_down, start_outer_down],
+                    faces,
+                    face_lookup,
+                )
+                _add_face(
+                    [start_inner, start_inner_down, end_inner_down, end_inner],
+                    faces,
+                    face_lookup,
+                )
 
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(vertices, [], faces)
@@ -186,32 +286,78 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
         min=0.001,
         unit="LENGTH",
     )
-    stair_type: EnumProperty(
-        name="Type",
-        description="Choose the base stair topology",
-        items=(
-            ("BASIC", "Type 1", "Base stair with the additional lower triangle"),
-            ("LAYER", "Type 2 - Extra Layer", "Base stair with an extra lower offset layer"),
-        ),
-        default="BASIC",
+    use_lower_slab: BoolProperty(
+        name="Lower Slab",
+        description="Add a lower offset slab under regular stair modules",
+        default=False,
     )
-    layer_z_offset: FloatProperty(
-        name="Layer Z Offset",
-        description="Vertical offset of the extra lower layer for Type 2 stairs",
+    lower_slab_z_offset: FloatProperty(
+        name="Slab Z Offset",
+        description="Vertical offset of the lower slab",
         default=0.08,
         min=0.0,
         unit="LENGTH",
     )
+    use_side_ribs: BoolProperty(
+        name="Side Ribs",
+        description="Add reinforcement ribs under both side edges of regular stair modules",
+        default=False,
+    )
+    rib_width: FloatProperty(
+        name="Rib Width",
+        description="Width of each side reinforcement rib measured inward from the side",
+        default=0.15,
+        min=0.001,
+        unit="LENGTH",
+    )
+    rib_z_offset: FloatProperty(
+        name="Rib Z Offset",
+        description="Downward extrusion distance for the side reinforcement ribs",
+        default=0.08,
+        min=0.0,
+        unit="LENGTH",
+    )
+    cut_top: BoolProperty(
+        name="Cut Top",
+        description="Continue the rib edge loops through the full stair surface",
+        default=False,
+    )
     simple_start: BoolProperty(
         name="Simple Start",
-        description="Make the first step rectangular, without the lower triangle or extra layer",
+        description="Make the first step rectangular, without the lower triangle, lower slab, or side ribs",
         default=False,
     )
     simple_end: BoolProperty(
         name="Simple End",
-        description="Make the last step rectangular, without the lower triangle or extra layer",
+        description="Make the last step rectangular, without the lower triangle, lower slab, or side ribs",
         default=False,
     )
+
+    def draw(self, context):
+        layout = self.layout
+
+        layout.prop(self, "step_count")
+        layout.prop(self, "width")
+        layout.prop(self, "riser")
+        layout.prop(self, "tread")
+
+        layout.separator()
+        layout.prop(self, "use_lower_slab")
+        slab_box = layout.column()
+        slab_box.enabled = self.use_lower_slab
+        slab_box.prop(self, "lower_slab_z_offset")
+
+        layout.separator()
+        layout.prop(self, "use_side_ribs")
+        rib_box = layout.column()
+        rib_box.enabled = self.use_side_ribs
+        rib_box.prop(self, "rib_width")
+        rib_box.prop(self, "rib_z_offset")
+        rib_box.prop(self, "cut_top")
+
+        layout.separator()
+        layout.prop(self, "simple_start")
+        layout.prop(self, "simple_end")
 
     def execute(self, context):
         mesh = build_stair_mesh(
@@ -220,8 +366,12 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
             self.width,
             self.riser,
             self.tread,
-            self.stair_type,
-            self.layer_z_offset,
+            self.use_lower_slab,
+            self.lower_slab_z_offset,
+            self.use_side_ribs,
+            self.rib_width,
+            self.rib_z_offset,
+            self.cut_top,
             self.simple_start,
             self.simple_end,
         )

@@ -24,7 +24,11 @@ The operator is available at:
 - **Width**: total width along `X`
 - **Riser**: vertical rise per step
 - **Tread**: run per step along negative `Y`
-- **Type 1**: base topology with an additional lower triangle
-- **Type 2 - Extra Layer**: base topology plus a lower layer offset by **Layer Z Offset**
-- **Simple Start**: first step is a simple rectangle, without the lower triangle or layer
-- **Simple End**: last step is a simple rectangle, without the lower triangle or layer
+- **Lower Slab**: adds a lower offset slab under regular stair modules
+- **Slab Z Offset**: vertical offset of the lower slab, enabled only when **Lower Slab** is checked
+- **Side Ribs**: adds reinforcement ribs below both side edges of regular stair modules
+- **Rib Width**: width of each side rib, measured inward from the side
+- **Rib Z Offset**: downward extrusion distance for side ribs
+- **Cut Top**: when enabled, the rib edge loops continue through the top stair polygons; when disabled, only the bottom region is cut
+- **Simple Start**: first step is a simple rectangle, without the lower triangle, lower slab, or side ribs
+- **Simple End**: last step is a simple rectangle, without the lower triangle, lower slab, or side ribs
