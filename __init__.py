@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Modular Stair Generator",
     "author": "Codex",
-    "version": (1, 1, 0),
+    "version": (1, 4, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Add > Mesh > Modular Stairs",
     "description": "Generate merged modular stairs running from the origin along negative Y.",
@@ -33,35 +33,29 @@ def _add_vertex(coord, vertices, vertex_lookup):
 
 
 def _add_face(indices, faces, face_lookup):
-    if len(set(indices)) != len(indices):
+    cleaned = []
+    for index in indices:
+        if not cleaned or cleaned[-1] != index:
+            cleaned.append(index)
+    if len(cleaned) > 1 and cleaned[0] == cleaned[-1]:
+        cleaned.pop()
+
+    if len(cleaned) < 3 or len(set(cleaned)) != len(cleaned):
         return
 
-    key = tuple(sorted(indices))
+    key = tuple(sorted(cleaned))
     if key in face_lookup:
         return
 
     face_lookup.add(key)
-    faces.append(indices)
+    faces.append(cleaned)
 
 
-def _step_profile(step_index, tread, riser, use_lower_slab, lower_slab_z_offset, is_simple):
+def _step_profile(step_index, tread, riser, use_lower_slab, lower_slab_z_offset):
     y_front = -step_index * tread
     y_back = -(step_index + 1) * tread
     z_base = step_index * riser
     z_top = (step_index + 1) * riser
-
-    if is_simple:
-        return {
-            "points": {
-                "B": (y_front, z_base),
-                "C": (y_front, z_top),
-                "D": (y_back, z_top),
-                "E": (y_back, z_base),
-            },
-            "cap_faces": (("B", "C", "D", "E"),),
-            "outer_edges": (("B", "C"), ("C", "D"), ("D", "E"), ("E", "B")),
-            "bottom_edge": None,
-        }
 
     z_under_front = z_base - riser
     points = {
@@ -122,8 +116,6 @@ def build_stair_mesh(
     rib_width,
     rib_z_offset,
     cut_top,
-    simple_start,
-    simple_end,
 ):
     half_width = width * 0.5
     rib_width = _reinforcement_width(width, rib_width)
@@ -139,17 +131,26 @@ def build_stair_mesh(
         y_value, z_value = point
         return _add_vertex((x_value, y_value, z_value), vertices, vertex_lookup)
 
+    def surface_vertex_for(profile, point_name, x_value):
+        point = profile["points"][point_name]
+        bottom_edge = profile["bottom_edge"]
+        if not can_build_ribs or bottom_edge is None or cut_top or point_name in bottom_edge:
+            return vertex_for(point, x_value)
+
+        if abs(x_value - (-half_width + rib_width)) <= EPSILON:
+            return vertex_for(point, -half_width)
+        if abs(x_value - (half_width - rib_width)) <= EPSILON:
+            return vertex_for(point, half_width)
+
+        return vertex_for(point, x_value)
+
     for step_index in range(step_count):
-        is_simple = (step_index == 0 and simple_start) or (
-            step_index == step_count - 1 and simple_end
-        )
         profile = _step_profile(
             step_index,
             tread,
             riser,
             use_lower_slab,
             lower_slab_z_offset,
-            is_simple,
         )
 
         def vertices_for_names(names, x_value):
@@ -160,25 +161,26 @@ def build_stair_mesh(
             _add_face(vertices_for_names(reversed(cap_face), half_width), faces, face_lookup)
 
         for edge_start, edge_end in profile["outer_edges"]:
+            step_has_ribs = can_build_ribs and profile["bottom_edge"] is not None
             x_values = full_x_values
-            if can_build_ribs and profile["bottom_edge"] == (edge_start, edge_end):
-                x_values = rib_x_values
-            elif can_build_ribs and cut_top:
+            if step_has_ribs and profile["bottom_edge"] == (edge_start, edge_end):
+                x_values = rib_x_values[1:3]
+            elif step_has_ribs:
                 x_values = rib_x_values
 
             for x_start, x_end in zip(x_values, x_values[1:]):
                 _add_face(
                     [
-                        vertex_for(profile["points"][edge_start], x_start),
-                        vertex_for(profile["points"][edge_end], x_start),
-                        vertex_for(profile["points"][edge_end], x_end),
-                        vertex_for(profile["points"][edge_start], x_end),
+                        surface_vertex_for(profile, edge_start, x_start),
+                        surface_vertex_for(profile, edge_end, x_start),
+                        surface_vertex_for(profile, edge_end, x_end),
+                        surface_vertex_for(profile, edge_start, x_end),
                     ],
                     faces,
                     face_lookup,
                 )
 
-        if can_build_ribs and profile["bottom_edge"] and not is_simple:
+        if can_build_ribs and profile["bottom_edge"]:
             bottom_start, bottom_end = profile["bottom_edge"]
             for outer_x, inner_x in (
                 (-half_width, -half_width + rib_width),
@@ -322,17 +324,6 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
         description="Continue the rib edge loops through the full stair surface",
         default=False,
     )
-    simple_start: BoolProperty(
-        name="Simple Start",
-        description="Make the first step rectangular, without the lower triangle, lower slab, or side ribs",
-        default=False,
-    )
-    simple_end: BoolProperty(
-        name="Simple End",
-        description="Make the last step rectangular, without the lower triangle, lower slab, or side ribs",
-        default=False,
-    )
-
     def draw(self, context):
         layout = self.layout
 
@@ -355,10 +346,6 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
         rib_box.prop(self, "rib_z_offset")
         rib_box.prop(self, "cut_top")
 
-        layout.separator()
-        layout.prop(self, "simple_start")
-        layout.prop(self, "simple_end")
-
     def execute(self, context):
         mesh = build_stair_mesh(
             "Modular_Stairs_Mesh",
@@ -372,8 +359,6 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
             self.rib_width,
             self.rib_z_offset,
             self.cut_top,
-            self.simple_start,
-            self.simple_end,
         )
         obj = object_data_add(context, mesh, operator=self)
         obj.name = "Modular Stairs"

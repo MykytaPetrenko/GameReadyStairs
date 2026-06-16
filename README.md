@@ -29,6 +29,4 @@ The operator is available at:
 - **Side Ribs**: adds reinforcement ribs below both side edges of regular stair modules
 - **Rib Width**: width of each side rib, measured inward from the side
 - **Rib Z Offset**: downward extrusion distance for side ribs
-- **Cut Top**: when enabled, the rib edge loops continue through the top stair polygons; when disabled, only the bottom region is cut
-- **Simple Start**: first step is a simple rectangle, without the lower triangle, lower slab, or side ribs
-- **Simple End**: last step is a simple rectangle, without the lower triangle, lower slab, or side ribs
+- **Cut Top**: when enabled, rib edge loops continue through the top stair polygons; when disabled, only the rib corner remains inset and the upper loop vertices collapse back to the sides
