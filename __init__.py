@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Modular Stair Generator",
     "author": "Codex",
-    "version": (1, 5, 0),
+    "version": (1, 5, 1),
     "blender": (3, 6, 0),
     "location": "View3D > Add > Mesh > Modular Stairs",
     "description": "Generate merged modular stairs running from the origin along negative Y.",
@@ -92,7 +92,8 @@ def _start_cut_profile(tread, riser, use_lower_slab, lower_slab_z_offset, cut_wi
     y_cut = -cut_width
     y_back = -tread
     z_base = 0.0
-    z_under = -riser
+    z_under_front = -riser
+    z_under_cut = z_under_front + riser * (cut_width / tread)
     z_top = riser
 
     if cut_width >= tread - EPSILON:
@@ -113,7 +114,7 @@ def _start_cut_profile(tread, riser, use_lower_slab, lower_slab_z_offset, cut_wi
         "C0": (y_front, z_top),
         "B1": (y_cut, z_base),
         "C1": (y_cut, z_top),
-        "A1": (y_cut, z_under),
+        "A1": (y_cut, z_under_cut),
         "D": (y_back, z_top),
         "E": (y_back, z_base),
     }
@@ -128,7 +129,7 @@ def _start_cut_profile(tread, riser, use_lower_slab, lower_slab_z_offset, cut_wi
     cap_faces.append(("A1", "B1", "E"))
 
     if use_lower_slab and lower_slab_z_offset > EPSILON:
-        points["F1"] = (y_cut, z_under - lower_slab_z_offset)
+        points["F1"] = (y_cut, z_under_cut - lower_slab_z_offset)
         points["G"] = (y_back, z_base - lower_slab_z_offset)
         cap_faces.append(("F1", "A1", "E", "G"))
         outer_edges.extend((("E", "G"), ("G", "F1"), ("F1", "A1"), ("A1", "B1"), ("B1", "B0")))
