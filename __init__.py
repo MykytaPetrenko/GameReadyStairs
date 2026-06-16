@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Modular Stair Generator",
     "author": "Codex",
-    "version": (1, 6, 0),
+    "version": (1, 6, 1),
     "blender": (3, 6, 0),
     "location": "View3D > Add > Mesh > Modular Stairs",
     "description": "Generate merged modular stairs running from the origin along negative Y.",
@@ -86,92 +86,6 @@ def _regular_step_profile(step_index, tread, riser, use_lower_slab, lower_slab_z
     }
 
 
-def _clip_profile_at_floor(profile, floor_z=0.0):
-    points = {}
-    point_lookup = {}
-    generated_index = 0
-
-    def point_name_for(coord, preferred_name=None):
-        nonlocal generated_index
-        key = _coord_key((coord[0], coord[1]))
-        name = point_lookup.get(key)
-        if name is not None:
-            return name
-
-        name = preferred_name
-        if name is None or name in points:
-            name = f"I{generated_index}"
-            generated_index += 1
-
-        points[name] = coord
-        point_lookup[key] = name
-        return name
-
-    def intersection(start_coord, end_coord):
-        start_y, start_z = start_coord
-        end_y, end_z = end_coord
-        if abs(end_z - start_z) <= EPSILON:
-            return (start_y, floor_z)
-        factor = (floor_z - start_z) / (end_z - start_z)
-        return (start_y + (end_y - start_y) * factor, floor_z)
-
-    def clip_face(face):
-        clipped = []
-        for index, end_name in enumerate(face):
-            start_name = face[index - 1]
-            start_coord = profile["points"][start_name]
-            end_coord = profile["points"][end_name]
-            start_inside = start_coord[1] >= floor_z - EPSILON
-            end_inside = end_coord[1] >= floor_z - EPSILON
-
-            if start_inside and not end_inside:
-                clipped.append(point_name_for(intersection(start_coord, end_coord)))
-            elif not start_inside and end_inside:
-                clipped.append(point_name_for(intersection(start_coord, end_coord)))
-                clipped.append(point_name_for(end_coord, end_name))
-            elif end_inside:
-                clipped.append(point_name_for(end_coord, end_name))
-
-        cleaned = []
-        for name in clipped:
-            if not cleaned or cleaned[-1] != name:
-                cleaned.append(name)
-        if len(cleaned) > 1 and cleaned[0] == cleaned[-1]:
-            cleaned.pop()
-
-        if len(cleaned) < 3 or len(set(cleaned)) < 3:
-            return None
-        return tuple(cleaned)
-
-    cap_faces = []
-    for cap_face in profile["cap_faces"]:
-        clipped_face = clip_face(cap_face)
-        if clipped_face is not None:
-            cap_faces.append(clipped_face)
-
-    edge_counts = {}
-    edge_orientations = {}
-    for cap_face in cap_faces:
-        for index, edge_start in enumerate(cap_face):
-            edge_end = cap_face[(index + 1) % len(cap_face)]
-            key = tuple(sorted((edge_start, edge_end)))
-            edge_counts[key] = edge_counts.get(key, 0) + 1
-            edge_orientations.setdefault(key, (edge_start, edge_end))
-
-    outer_edges = tuple(
-        edge_orientations[key]
-        for key, count in edge_counts.items()
-        if count == 1
-    )
-
-    return {
-        "points": points,
-        "cap_faces": tuple(cap_faces),
-        "outer_edges": outer_edges,
-        "bottom_edge": None,
-    }
-
-
 def _start_cut_profile(tread, riser, use_lower_slab, lower_slab_z_offset, cut_width, cut_type):
     cut_width = min(max(cut_width, 0.0), tread)
     y_front = 0.0
@@ -253,9 +167,6 @@ def _step_profile(
     if step_index != 0:
         return regular_profile
 
-    if start_cut_type == "FLOOR":
-        return _clip_profile_at_floor(regular_profile)
-
     if start_cut_type == "BOX" and start_cut_width > EPSILON:
         return _start_cut_profile(
             tread,
@@ -285,6 +196,111 @@ def _reinforcement_x_values(half_width, rib_width):
         half_width - rib_width,
         half_width,
     )
+
+
+def _clip_mesh_at_floor(vertices, faces, floor_z=0.0):
+    clipped_vertices = []
+    clipped_faces = []
+    vertex_lookup = {}
+    face_lookup = set()
+    floor_edge_counts = {}
+    floor_edge_orientations = {}
+
+    def add_clipped_vertex(coord):
+        x_value, y_value, z_value = coord
+        if abs(z_value - floor_z) <= EPSILON:
+            z_value = floor_z
+        return _add_vertex((x_value, y_value, z_value), clipped_vertices, vertex_lookup)
+
+    def is_inside(coord):
+        return coord[2] >= floor_z - EPSILON
+
+    def intersection(start_coord, end_coord):
+        start_z = start_coord[2]
+        end_z = end_coord[2]
+        if abs(end_z - start_z) <= EPSILON:
+            return (start_coord[0], start_coord[1], floor_z)
+
+        factor = (floor_z - start_z) / (end_z - start_z)
+        return (
+            start_coord[0] + (end_coord[0] - start_coord[0]) * factor,
+            start_coord[1] + (end_coord[1] - start_coord[1]) * factor,
+            floor_z,
+        )
+
+    def remember_floor_edge(start_index, end_index):
+        if start_index == end_index:
+            return
+        start_z = clipped_vertices[start_index][2]
+        end_z = clipped_vertices[end_index][2]
+        if abs(start_z - floor_z) > EPSILON or abs(end_z - floor_z) > EPSILON:
+            return
+
+        key = tuple(sorted((start_index, end_index)))
+        floor_edge_counts[key] = floor_edge_counts.get(key, 0) + 1
+        floor_edge_orientations.setdefault(key, (start_index, end_index))
+
+    for face in faces:
+        clipped_coords = []
+        for index, end_index in enumerate(face):
+            start_index = face[index - 1]
+            start_coord = vertices[start_index]
+            end_coord = vertices[end_index]
+            start_inside = is_inside(start_coord)
+            end_inside = is_inside(end_coord)
+
+            if start_inside and not end_inside:
+                clipped_coords.append(intersection(start_coord, end_coord))
+            elif not start_inside and end_inside:
+                clipped_coords.append(intersection(start_coord, end_coord))
+                clipped_coords.append(end_coord)
+            elif end_inside:
+                clipped_coords.append(end_coord)
+
+        clipped_indices = [add_clipped_vertex(coord) for coord in clipped_coords]
+        _add_face(clipped_indices, clipped_faces, face_lookup)
+
+        for start_index, end_index in zip(clipped_indices, clipped_indices[1:] + clipped_indices[:1]):
+            remember_floor_edge(start_index, end_index)
+
+    boundary_edges = {
+        edge for edge, count in floor_edge_counts.items()
+        if count == 1
+    }
+    adjacency = {}
+    for edge in boundary_edges:
+        start_index, end_index = floor_edge_orientations[edge]
+        adjacency.setdefault(start_index, set()).add(end_index)
+        adjacency.setdefault(end_index, set()).add(start_index)
+
+    unused_edges = set(boundary_edges)
+    while unused_edges:
+        edge = unused_edges.pop()
+        start_index, end_index = floor_edge_orientations[edge]
+        loop = [start_index, end_index]
+        previous_index = start_index
+        current_index = end_index
+
+        while current_index != start_index:
+            next_index = None
+            for candidate_index in adjacency.get(current_index, ()):
+                candidate_edge = tuple(sorted((current_index, candidate_index)))
+                if candidate_edge in unused_edges and candidate_index != previous_index:
+                    next_index = candidate_index
+                    break
+
+            if next_index is None:
+                break
+
+            unused_edges.remove(tuple(sorted((current_index, next_index))))
+            previous_index, current_index = current_index, next_index
+            if current_index != start_index:
+                loop.append(current_index)
+
+        if current_index == start_index:
+            _add_face(list(reversed(loop)), clipped_faces, face_lookup)
+
+    return clipped_vertices, clipped_faces
 
 
 def build_stair_mesh(
@@ -429,6 +445,9 @@ def build_stair_mesh(
                     face_lookup,
                 )
 
+    if start_cut_type == "FLOOR":
+        vertices, faces = _clip_mesh_at_floor(vertices, faces)
+
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(vertices, [], faces)
     mesh.update()
@@ -518,7 +537,7 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
         description="Choose the start cut mode",
         items=(
             ("NONE", "None", "Do not cut the start of the stairs"),
-            ("FLOOR", "Floor Cut", "Clip the first module at Z=0"),
+            ("FLOOR", "Floor Cut", "Clip the generated stair mesh at Z=0"),
             ("BOX", "Box Cut", "Cut into the first module by a fixed distance"),
         ),
         default="NONE",

@@ -33,4 +33,4 @@ The operator is available at:
 - **Cut Type**: start cut mode: **None**, **Floor Cut**, or **Box Cut**
 - **Cut Width**: box cut distance from the origin along negative `Y`; values at or above **Tread** remove the first module's lower triangle/slab/rib portion
 - **Cut Edge Flow**: available for **Box Cut** only; **Corner** merges the cut top to the tread corner, while **Through** keeps cut edges through the first module
-- **Floor Cut**: clips the first module at `Z=0`, removing lower triangle, slab, and rib geometry below the floor
+- **Floor Cut**: clips the full generated mesh at `Z=0`, removing any lower triangle, slab, or rib geometry below the floor
