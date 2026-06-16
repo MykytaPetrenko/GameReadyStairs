@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Modular Stair Generator",
     "author": "Codex",
-    "version": (1, 4, 0),
+    "version": (1, 5, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Add > Mesh > Modular Stairs",
     "description": "Generate merged modular stairs running from the origin along negative Y.",
@@ -10,7 +10,7 @@ bl_info = {
 
 import bmesh
 import bpy
-from bpy.props import BoolProperty, FloatProperty, IntProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty
 from bpy.types import Operator
 from bpy_extras.object_utils import AddObjectHelper, object_data_add
 
@@ -51,7 +51,7 @@ def _add_face(indices, faces, face_lookup):
     faces.append(cleaned)
 
 
-def _step_profile(step_index, tread, riser, use_lower_slab, lower_slab_z_offset):
+def _regular_step_profile(step_index, tread, riser, use_lower_slab, lower_slab_z_offset):
     y_front = -step_index * tread
     y_back = -(step_index + 1) * tread
     z_base = step_index * riser
@@ -86,6 +86,94 @@ def _step_profile(step_index, tread, riser, use_lower_slab, lower_slab_z_offset)
     }
 
 
+def _start_cut_profile(tread, riser, use_lower_slab, lower_slab_z_offset, cut_width, cut_type):
+    cut_width = min(max(cut_width, 0.0), tread)
+    y_front = 0.0
+    y_cut = -cut_width
+    y_back = -tread
+    z_base = 0.0
+    z_under = -riser
+    z_top = riser
+
+    if cut_width >= tread - EPSILON:
+        return {
+            "points": {
+                "B0": (y_front, z_base),
+                "C0": (y_front, z_top),
+                "D": (y_back, z_top),
+                "E": (y_back, z_base),
+            },
+            "cap_faces": (("B0", "C0", "D", "E"),),
+            "outer_edges": (("B0", "C0"), ("C0", "D"), ("D", "E"), ("E", "B0")),
+            "bottom_edge": None,
+        }
+
+    points = {
+        "B0": (y_front, z_base),
+        "C0": (y_front, z_top),
+        "B1": (y_cut, z_base),
+        "C1": (y_cut, z_top),
+        "A1": (y_cut, z_under),
+        "D": (y_back, z_top),
+        "E": (y_back, z_base),
+    }
+
+    if cut_type == "CORNER":
+        cap_faces = [("B0", "C0", "B1"), ("C0", "D", "E", "B1")]
+        outer_edges = [("B0", "C0"), ("C0", "D"), ("D", "E")]
+    else:
+        cap_faces = [("B0", "C0", "C1", "B1"), ("B1", "C1", "D", "E")]
+        outer_edges = [("B0", "C0"), ("C0", "C1"), ("C1", "D"), ("D", "E")]
+
+    cap_faces.append(("A1", "B1", "E"))
+
+    if use_lower_slab and lower_slab_z_offset > EPSILON:
+        points["F1"] = (y_cut, z_under - lower_slab_z_offset)
+        points["G"] = (y_back, z_base - lower_slab_z_offset)
+        cap_faces.append(("F1", "A1", "E", "G"))
+        outer_edges.extend((("E", "G"), ("G", "F1"), ("F1", "A1"), ("A1", "B1"), ("B1", "B0")))
+        bottom_edge = ("G", "F1")
+    else:
+        outer_edges.extend((("E", "A1"), ("A1", "B1"), ("B1", "B0")))
+        bottom_edge = ("E", "A1")
+
+    return {
+        "points": points,
+        "cap_faces": tuple(cap_faces),
+        "outer_edges": tuple(outer_edges),
+        "bottom_edge": bottom_edge,
+    }
+
+
+def _step_profile(
+    step_index,
+    tread,
+    riser,
+    use_lower_slab,
+    lower_slab_z_offset,
+    use_start_cut,
+    start_cut_width,
+    start_cut_type,
+):
+    if step_index == 0 and use_start_cut and start_cut_width > EPSILON:
+        return _start_cut_profile(
+            tread,
+            riser,
+            use_lower_slab,
+            lower_slab_z_offset,
+            start_cut_width,
+            start_cut_type,
+        )
+
+    return _regular_step_profile(
+        step_index,
+        tread,
+        riser,
+        use_lower_slab,
+        lower_slab_z_offset,
+    )
+
+
 def _reinforcement_width(total_width, requested_width):
     maximum_width = total_width * 0.5 - EPSILON
     if maximum_width <= EPSILON:
@@ -116,6 +204,9 @@ def build_stair_mesh(
     rib_width,
     rib_z_offset,
     cut_top,
+    use_start_cut,
+    start_cut_width,
+    start_cut_type,
 ):
     half_width = width * 0.5
     rib_width = _reinforcement_width(width, rib_width)
@@ -151,6 +242,9 @@ def build_stair_mesh(
             riser,
             use_lower_slab,
             lower_slab_z_offset,
+            use_start_cut,
+            start_cut_width,
+            start_cut_type,
         )
 
         def vertices_for_names(names, x_value):
@@ -324,6 +418,27 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
         description="Continue the rib edge loops through the full stair surface",
         default=False,
     )
+    use_start_cut: BoolProperty(
+        name="Start Cut",
+        description="Cut the beginning of the first stair module",
+        default=False,
+    )
+    start_cut_width: FloatProperty(
+        name="Cut Width",
+        description="Cut distance from the stair origin along negative Y",
+        default=0.1,
+        min=0.0,
+        unit="LENGTH",
+    )
+    start_cut_type: EnumProperty(
+        name="Cut Type",
+        description="Choose how the start cut transitions into the first tread",
+        items=(
+            ("THROUGH", "Type 1 - Through", "Cut edges continue through the first module"),
+            ("CORNER", "Type 2 - Corner", "Cut top vertices merge to the tread corner"),
+        ),
+        default="THROUGH",
+    )
     def draw(self, context):
         layout = self.layout
 
@@ -346,6 +461,13 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
         rib_box.prop(self, "rib_z_offset")
         rib_box.prop(self, "cut_top")
 
+        layout.separator()
+        layout.prop(self, "use_start_cut")
+        cut_box = layout.column()
+        cut_box.enabled = self.use_start_cut
+        cut_box.prop(self, "start_cut_width")
+        cut_box.prop(self, "start_cut_type")
+
     def execute(self, context):
         mesh = build_stair_mesh(
             "Modular_Stairs_Mesh",
@@ -359,6 +481,9 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
             self.rib_width,
             self.rib_z_offset,
             self.cut_top,
+            self.use_start_cut,
+            self.start_cut_width,
+            self.start_cut_type,
         )
         obj = object_data_add(context, mesh, operator=self)
         obj.name = "Modular Stairs"

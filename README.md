@@ -30,3 +30,6 @@ The operator is available at:
 - **Rib Width**: width of each side rib, measured inward from the side
 - **Rib Z Offset**: downward extrusion distance for side ribs
 - **Cut Top**: when enabled, rib edge loops continue through the top stair polygons; when disabled, only the rib corner remains inset and the upper loop vertices collapse back to the sides
+- **Start Cut**: enables a cut at the beginning of the first stair module
+- **Cut Width**: cut distance from the origin along negative `Y`; values at or above **Tread** remove the first module's lower triangle/slab/rib portion
+- **Cut Type**: **Type 1 - Through** keeps cut edges through the first module; **Type 2 - Corner** merges the cut top to the tread corner
