@@ -28,3 +28,14 @@ The operator is available at:
 - **Side Edge Offset**: creates the lower side edge loop from the stair top polyline
 - **Top Edge Loop**: adds width-wise loops near both side edges
 - **Top Edge Loop Width**: distance of those width-wise loops from each side
+
+## Bevel edge preparation
+
+Generated stairs automatically store only their central core width-wise stair
+edge coordinates, excluding the side offset and top edge loop strip edges.
+The first bottom edge and final top-back edge are intentionally skipped.
+
+For an existing stair mesh, run **Store Stair Core Width Edges** from Edit Mode's
+edge menu or Blender's operator search before beveling. After applying a manual
+bevel, run **Restore Stair Core Edge Selection** to select the current edges
+whose centers are closest to the stored original core edge coordinate pairs.

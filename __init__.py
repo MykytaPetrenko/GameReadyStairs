@@ -10,12 +10,15 @@ bl_info = {
 
 import bmesh
 import bpy
+import json
 from bpy.props import BoolProperty, FloatProperty, IntProperty
 from bpy.types import Operator
 from bpy_extras.object_utils import AddObjectHelper, object_data_add
 
 
 EPSILON = 0.000001
+STAIR_WIDTH_EDGES_PROP = "_modular_assets_stair_core_width_edges_v2"
+UP_FACE_NORMAL_Z = 0.5
 
 
 def _coord_key(coord):
@@ -106,6 +109,167 @@ def _x_values(width, use_top_edge_loop, top_edge_loop_width):
         half_width - loop_width,
         half_width,
     )
+
+
+def _edge_center_from_coords(coords):
+    return tuple((coords[0][axis] + coords[1][axis]) * 0.5 for axis in range(3))
+
+
+def _distance_squared(a, b):
+    return sum((a[axis] - b[axis]) ** 2 for axis in range(3))
+
+
+def _coords_from_edge(edge):
+    return [
+        [float(edge.verts[0].co[axis]) for axis in range(3)],
+        [float(edge.verts[1].co[axis]) for axis in range(3)],
+    ]
+
+
+def _edge_is_widthwise(edge):
+    first = edge.verts[0].co
+    second = edge.verts[1].co
+    return (
+        abs(first.x - second.x) > EPSILON
+        and abs(first.y - second.y) <= EPSILON
+        and abs(first.z - second.z) <= EPSILON
+    )
+
+
+def _edge_touches_top_face(edge):
+    return any(face.normal.z > UP_FACE_NORMAL_Z for face in edge.link_faces)
+
+
+def _edge_x_center(edge):
+    return (edge.verts[0].co.x + edge.verts[1].co.x) * 0.5
+
+
+def _without_terminal_top_back_edge(edges):
+    if len(edges) <= 1:
+        return edges
+
+    def profile_key(item):
+        center = _edge_center_from_coords(item["vertices"])
+        return (round(center[2], 6), round(-center[1], 6))
+
+    terminal_key = max(profile_key(item) for item in edges)
+    return [item for item in edges if profile_key(item) != terminal_key]
+
+
+def _top_core_width_edges_from_bmesh(bm):
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.normal_update()
+
+    grouped_edges = {}
+    for edge in bm.edges:
+        if not _edge_is_widthwise(edge) or not _edge_touches_top_face(edge):
+            continue
+
+        coords = _coords_from_edge(edge)
+        yz_key = (round(coords[0][1], 6), round(coords[0][2], 6))
+        grouped_edges.setdefault(yz_key, []).append(edge)
+
+    edges = []
+    seen = set()
+    for group in grouped_edges.values():
+        edge = min(group, key=lambda item: (abs(_edge_x_center(item)), -item.calc_length()))
+        coords = _coords_from_edge(edge)
+        edge_key = tuple(sorted(_coord_key(coord) for coord in coords))
+        if edge_key in seen:
+            continue
+
+        seen.add(edge_key)
+        edges.append({"vertices": coords})
+
+    edges = _without_terminal_top_back_edge(edges)
+    edges.sort(key=lambda item: _edge_center_from_coords(item["vertices"]))
+    return edges
+
+
+def _generated_top_core_width_edges(step_count, tread, riser, x_values):
+    top_points = _stair_top_polyline(step_count, tread, riser)
+    if len(x_values) > 2:
+        core_x_values = (x_values[1], x_values[-2])
+    else:
+        core_x_values = (x_values[0], x_values[-1])
+
+    edges = []
+    for y_value, z_value in top_points[1:-1]:
+        edges.append(
+            {
+                "vertices": [
+                    [float(core_x_values[0]), float(y_value), float(z_value)],
+                    [float(core_x_values[1]), float(y_value), float(z_value)],
+                ],
+            }
+        )
+    return edges
+
+
+def _store_width_edges(obj, edges):
+    payload = {
+        "version": 1,
+        "object": obj.name,
+        "edge_count": len(edges),
+        "edges": edges,
+    }
+    obj[STAIR_WIDTH_EDGES_PROP] = json.dumps(payload)
+
+
+def _load_width_edges(obj):
+    raw_payload = obj.get(STAIR_WIDTH_EDGES_PROP)
+    if not raw_payload:
+        return []
+
+    try:
+        payload = json.loads(raw_payload)
+    except (TypeError, ValueError):
+        return []
+
+    edges = []
+    for item in payload.get("edges", []):
+        vertices = item.get("vertices")
+        if (
+            isinstance(vertices, list)
+            and len(vertices) == 2
+            and all(isinstance(coord, list) and len(coord) == 3 for coord in vertices)
+        ):
+            edges.append(
+                {
+                    "vertices": [
+                        [float(value) for value in vertices[0]],
+                        [float(value) for value in vertices[1]],
+                    ],
+                }
+            )
+    return edges
+
+
+def _active_mesh_object(context):
+    obj = context.active_object
+    if obj and obj.type == "MESH":
+        return obj
+    return None
+
+
+def _with_object_bmesh(obj, callback):
+    if obj.mode == "EDIT":
+        bm = bmesh.from_edit_mesh(obj.data)
+        result = callback(bm)
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        return result
+
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    try:
+        result = callback(bm)
+        bm.to_mesh(obj.data)
+        obj.data.update()
+        return result
+    finally:
+        bm.free()
 
 
 def build_stair_mesh(
@@ -260,12 +424,130 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
         obj = object_data_add(context, mesh, operator=self)
         obj.name = "Modular Stairs"
         obj.location = (0.0, 0.0, 0.0)
+        _store_width_edges(
+            obj,
+            _generated_top_core_width_edges(
+                self.step_count,
+                self.tread,
+                self.riser,
+                _x_values(self.width, self.use_top_edge_loop, self.top_edge_loop_width),
+            ),
+        )
 
         if not obj.data.materials:
             material = bpy.data.materials.new("Stair Concrete")
             material.diffuse_color = (0.55, 0.55, 0.52, 1.0)
             obj.data.materials.append(material)
 
+        return {"FINISHED"}
+
+
+class MODULAR_ASSETS_OT_store_stair_width_edges(Operator):
+    bl_idname = "mesh.modular_assets_store_stair_width_edges"
+    bl_label = "Store Stair Core Width Edges"
+    bl_description = "Store only the central core stair edges running along the width as vertex coordinate pairs"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return _active_mesh_object(context) is not None
+
+    def execute(self, context):
+        obj = _active_mesh_object(context)
+        edges = _with_object_bmesh(obj, _top_core_width_edges_from_bmesh)
+        if not edges:
+            self.report({"WARNING"}, "No core width-wise stair edges were found")
+            return {"CANCELLED"}
+
+        _store_width_edges(obj, edges)
+        self.report({"INFO"}, f"Stored {len(edges)} stair core width edges")
+        return {"FINISHED"}
+
+
+class MODULAR_ASSETS_OT_restore_stair_width_edges(Operator):
+    bl_idname = "mesh.modular_assets_restore_stair_width_edges"
+    bl_label = "Restore Stair Core Edge Selection"
+    bl_description = "Select the current edges whose centers are closest to stored stair core edge centers"
+    bl_options = {"REGISTER", "UNDO"}
+
+    clear_selection: BoolProperty(
+        name="Clear Selection",
+        description="Clear the current mesh selection before restoring the stored stair edge selection",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return _active_mesh_object(context) is not None
+
+    def execute(self, context):
+        obj = _active_mesh_object(context)
+        stored_edges = _load_width_edges(obj)
+        if not stored_edges:
+            self.report({"WARNING"}, "No stored stair core edges were found on the active object")
+            return {"CANCELLED"}
+
+        def restore_selection(bm):
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.edges.index_update()
+
+            if self.clear_selection:
+                for vertex in bm.verts:
+                    vertex.select_set(False)
+                for edge in bm.edges:
+                    edge.select_set(False)
+                for face in bm.faces:
+                    face.select_set(False)
+
+            candidates = [
+                (
+                    edge,
+                    tuple((edge.verts[0].co[axis] + edge.verts[1].co[axis]) * 0.5 for axis in range(3)),
+                )
+                for edge in bm.edges
+            ]
+            selected_edges = set()
+            max_distance = 0.0
+
+            for stored_edge in stored_edges:
+                stored_center = _edge_center_from_coords(stored_edge["vertices"])
+                nearest = sorted(
+                    candidates,
+                    key=lambda item: _distance_squared(stored_center, item[1]),
+                )
+
+                chosen = None
+                chosen_distance = 0.0
+                for candidate_edge, candidate_center in nearest:
+                    if candidate_edge.index in selected_edges:
+                        continue
+                    chosen = candidate_edge
+                    chosen_distance = _distance_squared(stored_center, candidate_center)
+                    break
+
+                if chosen is None and nearest:
+                    chosen = nearest[0][0]
+                    chosen_distance = _distance_squared(stored_center, nearest[0][1])
+
+                if chosen is not None:
+                    chosen.select_set(True)
+                    selected_edges.add(chosen.index)
+                    max_distance = max(max_distance, chosen_distance)
+
+            bm.select_flush_mode()
+            return len(selected_edges), max_distance ** 0.5
+
+        selected_count, max_distance = _with_object_bmesh(obj, restore_selection)
+        context.tool_settings.mesh_select_mode = (False, True, False)
+
+        if obj.mode != "EDIT":
+            bpy.ops.object.mode_set(mode="EDIT")
+
+        self.report(
+            {"INFO"},
+            f"Restored {selected_count} stair core edges; max center distance {max_distance:.6f}",
+        )
         return {"FINISHED"}
 
 
@@ -277,8 +559,24 @@ def add_stairs_menu(self, context):
     )
 
 
+def stair_width_edges_menu(self, context):
+    self.layout.separator()
+    self.layout.operator(
+        MODULAR_ASSETS_OT_store_stair_width_edges.bl_idname,
+        text="Store Stair Core Width Edges",
+        icon="EDGESEL",
+    )
+    self.layout.operator(
+        MODULAR_ASSETS_OT_restore_stair_width_edges.bl_idname,
+        text="Restore Stair Core Edge Selection",
+        icon="RESTRICT_SELECT_OFF",
+    )
+
+
 classes = (
     MODULAR_ASSETS_OT_add_stairs,
+    MODULAR_ASSETS_OT_store_stair_width_edges,
+    MODULAR_ASSETS_OT_restore_stair_width_edges,
 )
 
 
@@ -286,9 +584,11 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.VIEW3D_MT_mesh_add.append(add_stairs_menu)
+    bpy.types.VIEW3D_MT_edit_mesh_edges.append(stair_width_edges_menu)
 
 
 def unregister():
+    bpy.types.VIEW3D_MT_edit_mesh_edges.remove(stair_width_edges_menu)
     bpy.types.VIEW3D_MT_mesh_add.remove(add_stairs_menu)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
