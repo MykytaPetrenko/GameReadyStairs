@@ -1,16 +1,16 @@
 bl_info = {
     "name": "Modular Stair Generator",
     "author": "Codex",
-    "version": (1, 6, 1),
+    "version": (2, 0, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Add > Mesh > Modular Stairs",
-    "description": "Generate merged modular stairs running from the origin along negative Y.",
+    "description": "Generate modular stair top meshes running from the origin along negative Y.",
     "category": "Add Mesh",
 }
 
 import bmesh
 import bpy
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty
+from bpy.props import BoolProperty, FloatProperty, IntProperty
 from bpy.types import Operator
 from bpy_extras.object_utils import AddObjectHelper, object_data_add
 
@@ -51,256 +51,61 @@ def _add_face(indices, faces, face_lookup):
     faces.append(cleaned)
 
 
-def _regular_step_profile(step_index, tread, riser, use_lower_slab, lower_slab_z_offset):
-    y_front = -step_index * tread
-    y_back = -(step_index + 1) * tread
-    z_base = step_index * riser
-    z_top = (step_index + 1) * riser
+def _stair_top_polyline(step_count, tread, riser):
+    points = [(0.0, 0.0)]
+    for step_index in range(step_count):
+        y_front = -step_index * tread
+        y_back = -(step_index + 1) * tread
+        z_top = (step_index + 1) * riser
+        points.append((y_front, z_top))
+        points.append((y_back, z_top))
 
-    z_under_front = z_base - riser
-    points = {
-        "A": (y_front, z_under_front),
-        "B": (y_front, z_base),
-        "C": (y_front, z_top),
-        "D": (y_back, z_top),
-        "E": (y_back, z_base),
-    }
-    cap_faces = [("A", "B", "E"), ("B", "C", "D", "E")]
-    outer_edges = [("A", "B"), ("B", "C"), ("C", "D"), ("D", "E")]
-
-    if use_lower_slab and lower_slab_z_offset > EPSILON:
-        points["F"] = (y_front, z_under_front - lower_slab_z_offset)
-        points["G"] = (y_back, z_base - lower_slab_z_offset)
-        cap_faces.insert(0, ("F", "A", "E", "G"))
-        outer_edges.extend((("E", "G"), ("G", "F"), ("F", "A")))
-        bottom_edge = ("G", "F")
-    else:
-        outer_edges.append(("E", "A"))
-        bottom_edge = ("E", "A")
-
-    return {
-        "points": points,
-        "cap_faces": tuple(cap_faces),
-        "outer_edges": tuple(outer_edges),
-        "bottom_edge": bottom_edge,
-    }
+    return points
 
 
-def _start_cut_profile(tread, riser, use_lower_slab, lower_slab_z_offset, cut_width, cut_type):
-    cut_width = min(max(cut_width, 0.0), tread)
-    y_front = 0.0
-    y_cut = -cut_width
-    y_back = -tread
-    z_base = 0.0
-    z_under_front = -riser
-    z_under_cut = z_under_front + riser * (cut_width / tread)
-    z_top = riser
+def _side_offset_polyline(top_points, offset):
+    last_index = len(top_points) - 1
+    offset_points = []
 
-    if cut_width >= tread - EPSILON:
-        return {
-            "points": {
-                "B0": (y_front, z_base),
-                "C0": (y_front, z_top),
-                "D": (y_back, z_top),
-                "E": (y_back, z_base),
-            },
-            "cap_faces": (("B0", "C0", "D", "E"),),
-            "outer_edges": (("B0", "C0"), ("C0", "D"), ("D", "E"), ("E", "B0")),
-            "bottom_edge": None,
-        }
+    for index, (y_value, z_value) in enumerate(top_points):
+        if index == 0:
+            offset_points.append((y_value - offset, z_value))
+        elif index == last_index:
+            offset_points.append((y_value, z_value - offset))
+        else:
+            offset_points.append((y_value - offset, z_value - offset))
 
-    points = {
-        "B0": (y_front, z_base),
-        "C0": (y_front, z_top),
-        "B1": (y_cut, z_base),
-        "C1": (y_cut, z_top),
-        "A1": (y_cut, z_under_cut),
-        "D": (y_back, z_top),
-        "E": (y_back, z_base),
-    }
-
-    if cut_type == "CORNER":
-        cap_faces = [("B0", "C0", "B1"), ("C0", "D", "E", "B1")]
-        outer_edges = [("B0", "C0"), ("C0", "D"), ("D", "E")]
-    else:
-        cap_faces = [("B0", "C0", "C1", "B1"), ("B1", "C1", "D", "E")]
-        outer_edges = [("B0", "C0"), ("C0", "C1"), ("C1", "D"), ("D", "E")]
-
-    cap_faces.append(("A1", "B1", "E"))
-
-    if use_lower_slab and lower_slab_z_offset > EPSILON:
-        points["F1"] = (y_cut, z_under_cut - lower_slab_z_offset)
-        points["G"] = (y_back, z_base - lower_slab_z_offset)
-        cap_faces.append(("F1", "A1", "E", "G"))
-        outer_edges.extend((("E", "G"), ("G", "F1"), ("F1", "A1"), ("A1", "B1"), ("B1", "B0")))
-        bottom_edge = ("G", "F1")
-    else:
-        outer_edges.extend((("E", "A1"), ("A1", "B1"), ("B1", "B0")))
-        bottom_edge = ("E", "A1")
-
-    return {
-        "points": points,
-        "cap_faces": tuple(cap_faces),
-        "outer_edges": tuple(outer_edges),
-        "bottom_edge": bottom_edge,
-    }
+    return offset_points
 
 
-def _step_profile(
-    step_index,
-    tread,
-    riser,
-    use_lower_slab,
-    lower_slab_z_offset,
-    start_cut_type,
-    start_cut_width,
-    start_cut_edge_flow,
-):
-    regular_profile = _regular_step_profile(
-        step_index,
-        tread,
-        riser,
-        use_lower_slab,
-        lower_slab_z_offset,
-    )
-
-    if step_index != 0:
-        return regular_profile
-
-    if start_cut_type == "BOX" and start_cut_width > EPSILON:
-        return _start_cut_profile(
-            tread,
-            riser,
-            use_lower_slab,
-            lower_slab_z_offset,
-            start_cut_width,
-            start_cut_edge_flow,
-        )
-
-    return regular_profile
+def _profile_data(step_count, tread, riser, side_edge_offset):
+    top_points = _stair_top_polyline(step_count, tread, riser)
+    offset_points = _side_offset_polyline(top_points, side_edge_offset)
+    boundary = top_points + list(reversed(offset_points))
+    strip_faces = [
+        (index, index + 1, len(top_points) + index + 1, len(top_points) + index)
+        for index in range(len(top_points) - 1)
+    ]
+    points = top_points + offset_points
+    return points, boundary, strip_faces
 
 
-def _reinforcement_width(total_width, requested_width):
-    maximum_width = total_width * 0.5 - EPSILON
-    if maximum_width <= EPSILON:
-        return 0.0
-    return min(max(requested_width, 0.0), maximum_width)
-
-
-def _reinforcement_x_values(half_width, rib_width):
-    if rib_width <= EPSILON:
+def _x_values(width, use_top_edge_loop, top_edge_loop_width):
+    half_width = width * 0.5
+    if not use_top_edge_loop:
         return (-half_width, half_width)
+
+    loop_width = max(top_edge_loop_width, 0.0)
+    loop_width = min(loop_width, half_width - EPSILON)
+    if loop_width <= EPSILON:
+        return (-half_width, half_width)
+
     return (
         -half_width,
-        -half_width + rib_width,
-        half_width - rib_width,
+        -half_width + loop_width,
+        half_width - loop_width,
         half_width,
     )
-
-
-def _clip_mesh_at_floor(vertices, faces, floor_z=0.0):
-    clipped_vertices = []
-    clipped_faces = []
-    vertex_lookup = {}
-    face_lookup = set()
-    floor_edge_counts = {}
-    floor_edge_orientations = {}
-
-    def add_clipped_vertex(coord):
-        x_value, y_value, z_value = coord
-        if abs(z_value - floor_z) <= EPSILON:
-            z_value = floor_z
-        return _add_vertex((x_value, y_value, z_value), clipped_vertices, vertex_lookup)
-
-    def is_inside(coord):
-        return coord[2] >= floor_z - EPSILON
-
-    def intersection(start_coord, end_coord):
-        start_z = start_coord[2]
-        end_z = end_coord[2]
-        if abs(end_z - start_z) <= EPSILON:
-            return (start_coord[0], start_coord[1], floor_z)
-
-        factor = (floor_z - start_z) / (end_z - start_z)
-        return (
-            start_coord[0] + (end_coord[0] - start_coord[0]) * factor,
-            start_coord[1] + (end_coord[1] - start_coord[1]) * factor,
-            floor_z,
-        )
-
-    def remember_floor_edge(start_index, end_index):
-        if start_index == end_index:
-            return
-        start_z = clipped_vertices[start_index][2]
-        end_z = clipped_vertices[end_index][2]
-        if abs(start_z - floor_z) > EPSILON or abs(end_z - floor_z) > EPSILON:
-            return
-
-        key = tuple(sorted((start_index, end_index)))
-        floor_edge_counts[key] = floor_edge_counts.get(key, 0) + 1
-        floor_edge_orientations.setdefault(key, (start_index, end_index))
-
-    for face in faces:
-        clipped_coords = []
-        for index, end_index in enumerate(face):
-            start_index = face[index - 1]
-            start_coord = vertices[start_index]
-            end_coord = vertices[end_index]
-            start_inside = is_inside(start_coord)
-            end_inside = is_inside(end_coord)
-
-            if start_inside and not end_inside:
-                clipped_coords.append(intersection(start_coord, end_coord))
-            elif not start_inside and end_inside:
-                clipped_coords.append(intersection(start_coord, end_coord))
-                clipped_coords.append(end_coord)
-            elif end_inside:
-                clipped_coords.append(end_coord)
-
-        clipped_indices = [add_clipped_vertex(coord) for coord in clipped_coords]
-        _add_face(clipped_indices, clipped_faces, face_lookup)
-
-        for start_index, end_index in zip(clipped_indices, clipped_indices[1:] + clipped_indices[:1]):
-            remember_floor_edge(start_index, end_index)
-
-    boundary_edges = {
-        edge for edge, count in floor_edge_counts.items()
-        if count == 1
-    }
-    adjacency = {}
-    for edge in boundary_edges:
-        start_index, end_index = floor_edge_orientations[edge]
-        adjacency.setdefault(start_index, set()).add(end_index)
-        adjacency.setdefault(end_index, set()).add(start_index)
-
-    unused_edges = set(boundary_edges)
-    while unused_edges:
-        edge = unused_edges.pop()
-        start_index, end_index = floor_edge_orientations[edge]
-        loop = [start_index, end_index]
-        previous_index = start_index
-        current_index = end_index
-
-        while current_index != start_index:
-            next_index = None
-            for candidate_index in adjacency.get(current_index, ()):
-                candidate_edge = tuple(sorted((current_index, candidate_index)))
-                if candidate_edge in unused_edges and candidate_index != previous_index:
-                    next_index = candidate_index
-                    break
-
-            if next_index is None:
-                break
-
-            unused_edges.remove(tuple(sorted((current_index, next_index))))
-            previous_index, current_index = current_index, next_index
-            if current_index != start_index:
-                loop.append(current_index)
-
-        if current_index == start_index:
-            _add_face(list(reversed(loop)), clipped_faces, face_lookup)
-
-    return clipped_vertices, clipped_faces
 
 
 def build_stair_mesh(
@@ -309,144 +114,54 @@ def build_stair_mesh(
     width,
     riser,
     tread,
-    use_lower_slab,
-    lower_slab_z_offset,
-    use_side_ribs,
-    rib_width,
-    rib_z_offset,
-    cut_top,
-    start_cut_type,
-    start_cut_width,
-    start_cut_edge_flow,
+    side_edge_offset,
+    use_top_edge_loop,
+    top_edge_loop_width,
 ):
-    half_width = width * 0.5
-    rib_width = _reinforcement_width(width, rib_width)
-    can_build_ribs = use_side_ribs and rib_width > EPSILON and rib_z_offset > EPSILON
-    rib_x_values = _reinforcement_x_values(half_width, rib_width)
-    full_x_values = (-half_width, half_width)
     vertices = []
     faces = []
     vertex_lookup = {}
     face_lookup = set()
 
-    def vertex_for(point, x_value):
+    profile_points, boundary_points, strip_faces = _profile_data(
+        step_count,
+        tread,
+        riser,
+        side_edge_offset,
+    )
+    x_values = _x_values(width, use_top_edge_loop, top_edge_loop_width)
+
+    def vertex_for(x_value, point):
         y_value, z_value = point
         return _add_vertex((x_value, y_value, z_value), vertices, vertex_lookup)
 
-    def surface_vertex_for(profile, point_name, x_value):
-        point = profile["points"][point_name]
-        bottom_edge = profile["bottom_edge"]
-        if not can_build_ribs or bottom_edge is None or cut_top or point_name in bottom_edge:
-            return vertex_for(point, x_value)
-
-        if abs(x_value - (-half_width + rib_width)) <= EPSILON:
-            return vertex_for(point, -half_width)
-        if abs(x_value - (half_width - rib_width)) <= EPSILON:
-            return vertex_for(point, half_width)
-
-        return vertex_for(point, x_value)
-
-    for step_index in range(step_count):
-        profile = _step_profile(
-            step_index,
-            tread,
-            riser,
-            use_lower_slab,
-            lower_slab_z_offset,
-            start_cut_type,
-            start_cut_width,
-            start_cut_edge_flow,
+    left_x = x_values[0]
+    right_x = x_values[-1]
+    for strip_face in strip_faces:
+        _add_face(
+            [vertex_for(left_x, profile_points[index]) for index in strip_face],
+            faces,
+            face_lookup,
+        )
+        _add_face(
+            [vertex_for(right_x, profile_points[index]) for index in reversed(strip_face)],
+            faces,
+            face_lookup,
         )
 
-        def vertices_for_names(names, x_value):
-            return [vertex_for(profile["points"][point_name], x_value) for point_name in names]
-
-        for cap_face in profile["cap_faces"]:
-            _add_face(vertices_for_names(cap_face, -half_width), faces, face_lookup)
-            _add_face(vertices_for_names(reversed(cap_face), half_width), faces, face_lookup)
-
-        for edge_start, edge_end in profile["outer_edges"]:
-            step_has_ribs = can_build_ribs and profile["bottom_edge"] is not None
-            x_values = full_x_values
-            if step_has_ribs and profile["bottom_edge"] == (edge_start, edge_end):
-                x_values = rib_x_values[1:3]
-            elif step_has_ribs:
-                x_values = rib_x_values
-
-            for x_start, x_end in zip(x_values, x_values[1:]):
-                _add_face(
-                    [
-                        surface_vertex_for(profile, edge_start, x_start),
-                        surface_vertex_for(profile, edge_end, x_start),
-                        surface_vertex_for(profile, edge_end, x_end),
-                        surface_vertex_for(profile, edge_start, x_end),
-                    ],
-                    faces,
-                    face_lookup,
-                )
-
-        if can_build_ribs and profile["bottom_edge"]:
-            bottom_start, bottom_end = profile["bottom_edge"]
-            for outer_x, inner_x in (
-                (-half_width, -half_width + rib_width),
-                (half_width, half_width - rib_width),
-            ):
-                start_outer = vertex_for(profile["points"][bottom_start], outer_x)
-                start_inner = vertex_for(profile["points"][bottom_start], inner_x)
-                end_outer = vertex_for(profile["points"][bottom_end], outer_x)
-                end_inner = vertex_for(profile["points"][bottom_end], inner_x)
-
-                start_y, start_z = profile["points"][bottom_start]
-                end_y, end_z = profile["points"][bottom_end]
-                start_outer_down = _add_vertex(
-                    (outer_x, start_y, start_z - rib_z_offset),
-                    vertices,
-                    vertex_lookup,
-                )
-                start_inner_down = _add_vertex(
-                    (inner_x, start_y, start_z - rib_z_offset),
-                    vertices,
-                    vertex_lookup,
-                )
-                end_outer_down = _add_vertex(
-                    (outer_x, end_y, end_z - rib_z_offset),
-                    vertices,
-                    vertex_lookup,
-                )
-                end_inner_down = _add_vertex(
-                    (inner_x, end_y, end_z - rib_z_offset),
-                    vertices,
-                    vertex_lookup,
-                )
-
-                _add_face(
-                    [start_outer_down, end_outer_down, end_inner_down, start_inner_down],
-                    faces,
-                    face_lookup,
-                )
-                _add_face(
-                    [start_outer, start_outer_down, start_inner_down, start_inner],
-                    faces,
-                    face_lookup,
-                )
-                _add_face(
-                    [end_inner, end_inner_down, end_outer_down, end_outer],
-                    faces,
-                    face_lookup,
-                )
-                _add_face(
-                    [start_outer, end_outer, end_outer_down, start_outer_down],
-                    faces,
-                    face_lookup,
-                )
-                _add_face(
-                    [start_inner, start_inner_down, end_inner_down, end_inner],
-                    faces,
-                    face_lookup,
-                )
-
-    if start_cut_type == "FLOOR":
-        vertices, faces = _clip_mesh_at_floor(vertices, faces)
+    for point_index, point_start in enumerate(boundary_points):
+        point_end = boundary_points[(point_index + 1) % len(boundary_points)]
+        for x_start, x_end in zip(x_values, x_values[1:]):
+            _add_face(
+                [
+                    vertex_for(x_start, point_start),
+                    vertex_for(x_start, point_end),
+                    vertex_for(x_end, point_end),
+                    vertex_for(x_end, point_start),
+                ],
+                faces,
+                face_lookup,
+            )
 
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(vertices, [], faces)
@@ -471,7 +186,7 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
     step_count: IntProperty(
         name="Steps",
         description="Number of stair modules to generate",
-        default=8,
+        default=3,
         min=1,
         soft_max=64,
     )
@@ -484,7 +199,7 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
     )
     riser: FloatProperty(
         name="Riser",
-        description="Vertical rise of one step",
+        description="Vertical rise between steps",
         default=0.2,
         min=0.001,
         unit="LENGTH",
@@ -496,68 +211,26 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
         min=0.001,
         unit="LENGTH",
     )
-    use_lower_slab: BoolProperty(
-        name="Lower Slab",
-        description="Add a lower offset slab under regular stair modules",
-        default=False,
-    )
-    lower_slab_z_offset: FloatProperty(
-        name="Slab Z Offset",
-        description="Vertical offset of the lower slab",
+    side_edge_offset: FloatProperty(
+        name="Side Edge Offset",
+        description="Offset distance used to create the lower side edge loop",
         default=0.08,
-        min=0.0,
+        min=0.001,
         unit="LENGTH",
     )
-    use_side_ribs: BoolProperty(
-        name="Side Ribs",
-        description="Add reinforcement ribs under both side edges of regular stair modules",
+    use_top_edge_loop: BoolProperty(
+        name="Top Edge Loop",
+        description="Split the top mesh with width-wise edge loops near both side edges",
         default=False,
     )
-    rib_width: FloatProperty(
-        name="Rib Width",
-        description="Width of each side reinforcement rib measured inward from the side",
+    top_edge_loop_width: FloatProperty(
+        name="Top Edge Loop Width",
+        description="Distance of the width-wise top edge loops from each side",
         default=0.15,
         min=0.001,
         unit="LENGTH",
     )
-    rib_z_offset: FloatProperty(
-        name="Rib Z Offset",
-        description="Downward extrusion distance for the side reinforcement ribs",
-        default=0.08,
-        min=0.0,
-        unit="LENGTH",
-    )
-    cut_top: BoolProperty(
-        name="Cut Top",
-        description="Continue the rib edge loops through the full stair surface",
-        default=False,
-    )
-    start_cut_type: EnumProperty(
-        name="Cut Type",
-        description="Choose the start cut mode",
-        items=(
-            ("NONE", "None", "Do not cut the start of the stairs"),
-            ("FLOOR", "Floor Cut", "Clip the generated stair mesh at Z=0"),
-            ("BOX", "Box Cut", "Cut into the first module by a fixed distance"),
-        ),
-        default="NONE",
-    )
-    start_cut_width: FloatProperty(
-        name="Cut Width",
-        description="Box cut distance from the stair origin along negative Y",
-        default=0.1,
-        min=0.0,
-        unit="LENGTH",
-    )
-    start_cut_edge_flow: EnumProperty(
-        name="Cut Edge Flow",
-        description="Choose how the box cut transitions into the first tread",
-        items=(
-            ("CORNER", "Corner", "Cut top vertices merge to the tread corner"),
-            ("THROUGH", "Through", "Cut edges continue through the first module"),
-        ),
-        default="THROUGH",
-    )
+
     def draw(self, context):
         layout = self.layout
 
@@ -565,28 +238,13 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
         layout.prop(self, "width")
         layout.prop(self, "riser")
         layout.prop(self, "tread")
+        layout.prop(self, "side_edge_offset")
 
         layout.separator()
-        layout.prop(self, "use_lower_slab")
-        slab_box = layout.column()
-        slab_box.enabled = self.use_lower_slab
-        slab_box.prop(self, "lower_slab_z_offset")
-
-        layout.separator()
-        layout.prop(self, "use_side_ribs")
-        rib_box = layout.column()
-        rib_box.enabled = self.use_side_ribs
-        rib_box.prop(self, "rib_width")
-        rib_box.prop(self, "rib_z_offset")
-        rib_box.prop(self, "cut_top")
-
-        layout.separator()
-        layout.label(text="Start Cut")
-        layout.prop(self, "start_cut_type")
-        cut_box = layout.column()
-        cut_box.enabled = self.start_cut_type == "BOX"
-        cut_box.prop(self, "start_cut_width")
-        cut_box.prop(self, "start_cut_edge_flow")
+        layout.prop(self, "use_top_edge_loop")
+        loop_box = layout.column()
+        loop_box.enabled = self.use_top_edge_loop
+        loop_box.prop(self, "top_edge_loop_width")
 
     def execute(self, context):
         mesh = build_stair_mesh(
@@ -595,15 +253,9 @@ class MODULAR_ASSETS_OT_add_stairs(Operator, AddObjectHelper):
             self.width,
             self.riser,
             self.tread,
-            self.use_lower_slab,
-            self.lower_slab_z_offset,
-            self.use_side_ribs,
-            self.rib_width,
-            self.rib_z_offset,
-            self.cut_top,
-            self.start_cut_type,
-            self.start_cut_width,
-            self.start_cut_edge_flow,
+            self.side_edge_offset,
+            self.use_top_edge_loop,
+            self.top_edge_loop_width,
         )
         obj = object_data_add(context, mesh, operator=self)
         obj.name = "Modular Stairs"
